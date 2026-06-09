@@ -1,0 +1,4 @@
+# Libraries are sourced at runtime; don't fail on "can't follow source".
+disable=SC1091
+# Allow shellcheck to follow sourced files when present.
+external-sources=true

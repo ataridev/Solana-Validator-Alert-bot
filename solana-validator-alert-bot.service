@@ -1,0 +1,19 @@
+[Unit]
+Description=Solana Validator Alert Bot (delinquency + dashboard monitor)
+After=network.target
+
+[Service]
+Type=simple
+# Adjust the path if the bot is not located in /root/Solana-Validator-Alert-bot
+ExecStart=/root/Solana-Validator-Alert-bot/bot.sh
+WorkingDirectory=/root/Solana-Validator-Alert-bot
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-validator-alert-bot
+Environment="PATH=/root/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=multi-user.target

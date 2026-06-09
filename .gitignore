@@ -1,0 +1,10 @@
+# Secrets & runtime (never commit these)
+secrets.env
+state/
+bot.log
+*.tmp
+
+# OS / editor noise
+.DS_Store
+*.swp
+*~
