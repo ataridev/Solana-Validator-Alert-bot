@@ -96,7 +96,10 @@ A single daemon with several polling cadences:
   The loop sleeps the *remainder* of the interval, so the period does not drift
   with RPC latency.
 - **Ping** (`PING_INTERVAL`, 60 s) — server reachability, bounded by `-W`/`-w`
-  so an unreachable host cannot stall the loop.
+  so an unreachable host cannot stall the loop. Alarms after
+  `PING_ALERT_THRESHOLD` failed rounds (ICMP is routinely rate-limited in
+  transit, so one bad round is not an outage) and repeats every
+  `PING_REPEAT_INTERVAL`.
 - **Balance** (`BALANCE_INTERVAL`, 10 min) — identity balance. Deliberately
   slower than the ping: a balance drains over hours.
 - **Skip rate** (`SKIP_CHECK_INTERVAL`, 10 min) — alarms past
@@ -108,9 +111,9 @@ A single daemon with several polling cadences:
 - **Summary** (`SUMMARY_INTERVAL`, 1 h) — full status report per node + epoch
   info. This is the only thing that downloads the whole validator list; one
   `jq` pass over it yields version, credits, stake, rank and cluster average.
-- **Daily** (`DAILY_INFO_HOUR`) — SFDP/KYC status and stake flows
-  (activating/deactivating). These need `solana stakes`, which scans the whole
-  stake program, and the numbers only move once per epoch.
+- **Daily** (`DAILY_INFO_HOUR`, `-1` to disable) — SFDP/KYC status and stake
+  flows (activating/deactivating). These need `solana stakes`, which scans the
+  whole stake program, and the numbers only move once per epoch.
 - **Heartbeat** (`HEARTBEAT_HOUR`) — "bot alive" message.
 
 ```

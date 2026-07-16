@@ -24,8 +24,14 @@ state_load() {
 }
 
 # Save: state_save <kind> <pubkey> <start> <count> <last>
+# Write to a temp file and rename, the way refresh_validators does. A plain
+# truncate-then-write torn by a kill, a restart or a full disk leaves a 0-byte
+# file, and alarm_step reads that as a brand-new problem: it re-fires an alarm
+# that already went out, or — on a disk that stays full — never gets the count
+# past the threshold, so the alarm never fires at all.
 state_save() {
-    echo "$3 $4 $5" > "$(_state_file "$1" "$2")"
+    local f; f="$(_state_file "$1" "$2")"
+    printf '%s %s %s\n' "$3" "$4" "$5" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" 2>/dev/null
 }
 
 # Remove state: state_clear <kind> <pubkey>

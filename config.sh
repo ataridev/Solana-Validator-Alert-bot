@@ -58,6 +58,12 @@ PING_INTERVAL=60             # how often to ping the server, seconds
 PING_COUNT=2                 # number of ping packets to send
 PING_TIMEOUT=1               # wait per packet, seconds (-W)
 PING_DEADLINE=3              # hard limit for the whole ping run, seconds (-w)
+PING_ALERT_THRESHOLD=2       # failed checks before alarming. ICMP is routinely
+                             # rate-limited in transit, so one bad round is not
+                             # yet an outage
+PING_REPEAT_INTERVAL=1800    # repeat "still unreachable", seconds. Also what
+                             # re-sends the alarm if Telegram was unreachable at
+                             # the same time as the node — a common pair
 
 # --- Balance ----------------------------------------------------------------
 # Separate from the ping cadence: an identity balance drains over hours, so

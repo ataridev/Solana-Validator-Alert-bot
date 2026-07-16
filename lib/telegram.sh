@@ -85,9 +85,15 @@ tg_send() {
 
 # Alarm message to the alarm chat. Retried: a dropped alarm is the exact
 # failure this bot exists to prevent.
+# The log must not claim an alarm was raised when Telegram never took it —
+# that is the one line someone reads while working out why they were not told.
 send_alarm() {
-    tg_send "$CHAT_ID_ALARM" "$1" "" "${ALARM_RETRIES:-3}"
-    log_message "ALARM -> $1"
+    if tg_send "$CHAT_ID_ALARM" "$1" "" "${ALARM_RETRIES:-3}"; then
+        log_message "ALARM -> $1"
+        return 0
+    fi
+    log_message "ALARM UNDELIVERED -> $1"
+    return 1
 }
 
 # Informational HTML message to the info chat. Not retried — a missed hourly

@@ -119,12 +119,41 @@ validate_secrets() {
 validate_config() {
     local ok=1 pk cl warn v
     # ${!v:-} so a parameter deleted from config.sh reports itself instead of
-    # dying with "unbound variable" under set -u.
-    for v in CHECK_INTERVAL PING_INTERVAL BALANCE_INTERVAL SUMMARY_INTERVAL \
-             SKIP_CHECK_INTERVAL SKIP_ALERT_THRESHOLD SKIP_ALERT_MIN_SLOTS \
+    # dying with "unbound variable" under set -u — which in an arithmetic
+    # context does not merely fail, it exits the shell.
+    #
+    # Leading zeros are then stripped: bash arithmetic reads 08/09 as octal and
+    # errors out. That error is silent in every context this config is used in
+    # — `(( elapsed < CHECK_INTERVAL ))` would skip the sleep and spin the loop
+    # at full tilt, and `printf '%02d'` would disable the daily report.
+    for v in CHECK_INTERVAL PING_INTERVAL BALANCE_INTERVAL BALANCE_REPEAT_INTERVAL \
+             SUMMARY_INTERVAL SKIP_CHECK_INTERVAL SKIP_ALERT_THRESHOLD \
+             SKIP_ALERT_MIN_SLOTS SKIP_REPEAT_INTERVAL PING_ALERT_THRESHOLD \
+             PING_REPEAT_INTERVAL VERSION_ALERT_THRESHOLD VERSION_REPEAT_INTERVAL \
              ALERT_THRESHOLD ALERT_REPEAT_INTERVAL DELINQUENT_SLOT_DISTANCE; do
-        if [[ ! "${!v:-}" =~ ^[0-9]+$ ]] || (( ${!v:-0} < 1 )); then
+        if [[ ! "${!v:-}" =~ ^[0-9]+$ ]]; then
             log_message "CONFIG: $v must be a positive integer (got '${!v:-<unset>}')"
+            ok=0
+            continue
+        fi
+        printf -v "$v" '%d' "$((10#${!v}))"
+        if (( ${!v} < 1 )); then
+            log_message "CONFIG: $v must be a positive integer (got '${!v}')"
+            ok=0
+        fi
+    done
+
+    # Hours: 0-23, or -1 to disable. Same octal trap, plus printf '%02d' turns
+    # an out-of-range hour into one that simply never matches the clock.
+    for v in DAILY_INFO_HOUR HEARTBEAT_HOUR; do
+        if [[ ! "${!v:-}" =~ ^(-1|[0-9]{1,2})$ ]]; then
+            log_message "CONFIG: $v must be an hour 0-23, or -1 to disable (got '${!v:-<unset>}')"
+            ok=0
+            continue
+        fi
+        [[ "${!v}" != "-1" ]] && printf -v "$v" '%d' "$((10#${!v}))"
+        if (( ${!v} > 23 )); then
+            log_message "CONFIG: $v must be an hour 0-23, or -1 to disable (got '${!v}')"
             ok=0
         fi
     done
@@ -182,6 +211,10 @@ check_delinquency() {
             return
             ;;
         not_found)
+            # Deliberately does not touch the delinq alarm: while the node is
+            # missing we cannot tell whether it is still behind, so that state
+            # is frozen rather than repeated or cleared. It resumes if the node
+            # comes back delinquent, and clears via the ok branch if it does not.
             alarm_step gone "$pubkey" 1 "$t"
             case "$ALARM_DECISION" in
                 first)
@@ -224,6 +257,12 @@ check_delinquency() {
 #  CHECKS (medium loop: ping + balance)
 # ============================================================================
 
+# Connectivity watchdog. Runs through alarm_step like every other check, which
+# buys two things it lacked: a confirmation threshold, so one burst of ICMP loss
+# (routinely rate-limited on transit links) is not an instant lost/restored
+# flap; and a repeat, so an alarm that Telegram refused is re-sent instead of
+# lost forever — the host losing upstream takes out the node check and the
+# delivery path at the same time, which is exactly when it must not be dropped.
 check_ping() {
     local pubkey="$1" name="$2" ip="$3"
     local recv; recv=$(ping_received "$ip")
@@ -237,18 +276,24 @@ check_ping() {
         return
     fi
 
-    if [[ "$recv" == "0" ]]; then
-        if ! state_active inet "$pubkey"; then
-            local t; t=$(now)
-            state_save inet "$pubkey" "$t" 1 "$t"
+    local t; t=$(now)
+    local down=0
+    [[ "$recv" == "0" ]] && down=1
+
+    alarm_step inet "$pubkey" "$down" "$t" \
+        "${PING_ALERT_THRESHOLD:-2}" "${PING_REPEAT_INTERVAL:-1800}"
+    case "$ALARM_DECISION" in
+        first)
             send_alarm "📡 ${name} — connectivity lost (ping ${ip} failing)!"
-        fi
-    else
-        if state_active inet "$pubkey"; then
+            ;;
+        repeat)
+            send_alarm "📡 ${name} — still unreachable (ping ${ip}, for $(( (t - ST_START) / 60 )) min)"
+            ;;
+        recover)
             send_alarm "📡 ${name} — connectivity restored (${ip})"
-            state_clear inet "$pubkey"
-        fi
-    fi
+            ;;
+    esac
+    return 0
 }
 
 # Skip rate watchdog. The dashboard has always shown this number, but only
@@ -303,7 +348,7 @@ check_version() {
     local majority; majority=$(cluster_majority_version "$cluster")
     [[ -z "$majority" ]] && return 0
 
-    local t; t=$(now) behind=0
+    local t behind=0; t=$(now)
     version_lt "$mine" "$majority" && behind=1
 
     alarm_step version "$pubkey" "$behind" "$t" \
@@ -319,31 +364,74 @@ check_version() {
     return 0
 }
 
+# Balance watchdog. threshold=1 — a balance reading does not flap, so there is
+# nothing to confirm; it alarms on the first low reading, as before, and repeats
+# every BALANCE_REPEAT_INTERVAL. No recovery message: a topped-up balance is not
+# news worth a notification.
 check_balance() {
     local pubkey="$1" name="$2" cluster="$3" warn="$4"
     local bal; bal=$(get_balance "$cluster" "$pubkey")
-    [[ -z "$bal" ]] && return   # could not fetch — stay quiet
+    [[ -z "$bal" ]] && return 0   # could not fetch — stay quiet
 
-    if (( $(bc <<< "$bal < $warn") )); then
-        local t; t=$(now)
-        state_load lowbal "$pubkey"
-        if [[ -z "$ST_START" ]] || (( t - ST_LAST >= BALANCE_REPEAT_INTERVAL )); then
+    local t; t=$(now)
+    local low=0
+    (( $(bc <<< "$bal < $warn") )) && low=1
+
+    alarm_step lowbal "$pubkey" "$low" "$t" 1 "${BALANCE_REPEAT_INTERVAL:-3600}"
+    case "$ALARM_DECISION" in
+        first|repeat)
             send_alarm "💰 ${name} — low identity balance: ${bal} SOL (threshold ${warn})"$'\n'"${pubkey}"
-            state_save lowbal "$pubkey" "${ST_START:-$t}" 1 "$t"
-        fi
-    else
-        state_active lowbal "$pubkey" && state_clear lowbal "$pubkey"
-    fi
+            ;;
+    esac
+    return 0
 }
 
 # ============================================================================
 #  DASHBOARD SUMMARY (rich info to the info chat)
 # ============================================================================
 
+# Solana Foundation delegation program record: sfdp_get <pubkey>
+sfdp_get() {
+    http_get "https://api.solana.org/api/validators/$1" 2>/dev/null
+}
+
+# Commission actually paid out, for the dashboard line:
+# summary_commission <cluster> <vote> <current_epoch> — prints "1.23 sol | ep 41"
+# or "n/a".
+# The old formula estimated this from credits, which stopped meaning anything
+# when timely vote credits raised the per-slot maximum from 1 to 16 (mainnet,
+# epoch 703). getInflationReward returns the real number. The current epoch has
+# no reward yet, hence epoch - 1.
+summary_commission() {
+    local cluster="$1" vote="$2" epoch="${3:-0}"
+    [[ -z "$vote" ]] && { echo "n/a"; return; }
+    (( epoch > 0 )) || { echo "n/a"; return; }
+
+    local reward_epoch=$(( epoch - 1 )) lamports
+    lamports=$(inflation_reward "$cluster" "$vote" "$reward_epoch")
+    if [[ -z "$lamports" ]]; then
+        echo "n/a"
+        return
+    fi
+    echo "$(lamports_to_sol "$lamports") sol | ep ${reward_epoch}"
+}
+
+# Onboarding line, testnet only and only while in the program:
+# sfdp_onboard_line <cluster> <pubkey>
+sfdp_onboard_line() {
+    local cluster="$1" pubkey="$2"
+    [[ "$cluster" == "m" || "${SFDP_ENABLED:-1}" != "1" ]] && return
+
+    local onboard; onboard=$(sfdp_get "$pubkey" | jq -r '.onboardingNumber // empty')
+    [[ -n "$onboard" && "$onboard" != "null" ]] && \
+        printf 'onboard > [%s]' "$(html_escape "$onboard")"
+    return 0
+}
+
 # Full dashboard for one node.
-# build_summary <pubkey> <name> <cluster> <vote> <current_epoch>
+# build_summary <pubkey> <name> <cluster> <vote> <current_epoch> <ip>
 build_summary() {
-    local pubkey="$1" name="$2" cluster="$3" vote="$4" epoch="${5:-0}"
+    local pubkey="$1" name="$2" cluster="$3" vote="$4" epoch="${5:-0}" ip="${6:-}"
 
     # Version, credits, stake, rank, cluster leader and average skip — one jq
     # pass over the cached list.
@@ -358,8 +446,7 @@ build_summary() {
     local epoch_credits="$NF_CREDITS"
     local rank="$NF_RANK"
 
-    # IP from config; fall back to gossip only when it is not set there.
-    local ip="${NODE_IP[$pubkey]:-}"
+    # Fall back to gossip only when config has no IP for this node.
     [[ -z "$ip" ]] && ip=$(node_ip "$cluster" "$pubkey")
 
     local average; average=$(printf "%.2f" "$NF_AVG_SKIP" 2>/dev/null)
@@ -376,11 +463,9 @@ build_summary() {
         | jq -r '.result."'"$pubkey"'" | length // 0' 2>/dev/null)
     [[ -z "$scheduled" || "$scheduled" == "null" ]] && scheduled=0
 
-    local bp_json; bp_json=$(rpc_call "$cluster" \
-        '{"jsonrpc":"2.0","id":1,"method":"getBlockProduction","params":[{"identity":"'"$pubkey"'"}]}')
-    local leader_slots produced
-    leader_slots=$(echo "$bp_json" | jq -r '.result.value.byIdentity."'"$pubkey"'"[0] // 0')
-    produced=$(echo "$bp_json"     | jq -r '.result.value.byIdentity."'"$pubkey"'"[1] // 0')
+    local leader_slots=0 produced=0
+    local bp; bp=$(block_production "$cluster" "$pubkey")
+    [[ -n "$bp" ]] && read -r leader_slots produced <<< "$bp"
     local skipped=$(( leader_slots - produced ))
     local skip=0
     (( leader_slots > 0 )) && skip=$(bc <<< "scale=2; $skipped*100/$leader_slots")
@@ -398,24 +483,8 @@ build_summary() {
     # running every hour.
     local active; active=$(lamports_to_sol "$NF_STAKE")
 
-    # Commission actually paid out for the last completed epoch. The old
-    # formula estimated it from credits, which stopped meaning anything when
-    # timely vote credits raised the per-slot maximum from 1 to 16 (mainnet,
-    # epoch 703). getInflationReward on the vote account returns the real
-    # number instead. The current epoch has no reward yet, hence epoch - 1.
-    local commission="n/a"
-    if [[ -n "$vote" ]] && (( epoch > 0 )); then
-        local reward_epoch=$(( epoch - 1 )) lamports
-        lamports=$(inflation_reward "$cluster" "$vote" "$reward_epoch")
-        [[ -n "$lamports" ]] && commission="$(lamports_to_sol "$lamports") sol | ep ${reward_epoch}"
-    fi
-
-    # Onboard (testnet only, until approval; hidden on mainnet)
-    local onboard_line=""
-    if [[ "$cluster" != "m" && "${SFDP_ENABLED:-1}" == "1" ]]; then
-        local onboard; onboard=$(http_get "https://api.solana.org/api/validators/$pubkey" 2>/dev/null | jq -r '.onboardingNumber // empty')
-        [[ -n "$onboard" && "$onboard" != "null" ]] && onboard_line="onboard > [$(html_escape "$onboard")]"
-    fi
+    local commission; commission=$(summary_commission "$cluster" "$vote" "$epoch")
+    local onboard_line; onboard_line=$(sfdp_onboard_line "$cluster" "$pubkey")
 
     # Build HTML
     printf '<b>%s</b> [%s] [%s]\n🌐 %s<code>\nAll:%s Done:%s skipped:%s\nskip:%s%s%% Average:%s%%\ncredits >[%s] [%s%%]\nrank>[%s] %s\nactive_stk >>>[%s]\nbalance>[%s]\nvote_balance>>[%s]\ncommission>[%s]</code>' \
@@ -459,7 +528,7 @@ send_epoch_info() {
 send_daily_info() {
     [[ "${SFDP_ENABLED:-1}" == "1" ]] || return
     local pubkey="$1" name="$2"
-    local info; info=$(http_get "https://api.solana.org/api/validators/$pubkey" 2>/dev/null)
+    local info; info=$(sfdp_get "$pubkey")
     local state kyc
     state=$(echo "$info" | jq -r '.state // "n/a"')
     kyc=$(echo "$info" | jq -r '.kycStatus // "n/a"')
@@ -490,11 +559,43 @@ send_daily_stake() {
         "$(html_escape "$name")" "${pubkey:0:8}" "$activating" "$deactivating")"
 }
 
+# The hourly report: refresh each cluster's cache, then a dashboard per node
+# and an epoch line per cluster. The full validator list is only pulled here —
+# the fast loop does not need it.
+send_hourly_report() {
+    # local -A, not declare -A: at main-loop scope these are globals, and a
+    # cluster that failed to refresh would keep last hour's ready flag.
+    local -A ready=() cluster_epoch=()
+    local cl pk
+
+    for cl in "${!used_clusters[@]}"; do
+        if refresh_validators "$cl" && cache_ready "$cl"; then
+            ready["$cl"]=1
+        fi
+        # Once per cluster: build_summary needs it for the previous epoch's reward.
+        cluster_epoch["$cl"]=$(current_epoch "$cl")
+    done
+
+    for pk in "${active_nodes[@]}"; do
+        cl="${NODE_CLUSTER[$pk]}"
+        # No fresh data — skip rather than report from a stale cache.
+        [[ "${ready[$cl]:-0}" == "1" ]] || continue
+        send_info "$(build_summary "$pk" "${NODE_NAME[$pk]}" "$cl" \
+            "${NODE_VOTE[$pk]:-}" "${cluster_epoch[$cl]:-0}" "${NODE_IP[$pk]:-}")"
+        # Rides the cache refresh — the data is already here.
+        check_version "$pk" "${NODE_NAME[$pk]}" "$cl"
+    done
+
+    for cl in "${!used_clusters[@]}"; do
+        send_epoch_info "$cl"
+    done
+}
+
 # ============================================================================
 #  HELPERS
 # ============================================================================
 
-# Zero-padded hour comparison helper: hour_is <HH-target>
+# Zero-padded hour comparison: hour_is <current_HH> <target_hour>
 hour_is() { [[ "$1" == "$(printf '%02d' "$2")" ]]; }
 
 # ============================================================================
@@ -568,29 +669,7 @@ while true; do
 
     # --- 5. Dashboard summary + epoch --------------------------------------
     if (( t - last_summary >= SUMMARY_INTERVAL )); then
-        # The full validator list is only needed for the dashboard, so it is
-        # fetched here — hourly — instead of on every fast cycle. A cluster
-        # whose refresh failed is skipped rather than reported from stale data.
-        declare -A ready=() cluster_epoch=()
-        for cl in "${!used_clusters[@]}"; do
-            if refresh_validators "$cl" && cache_ready "$cl"; then
-                ready["$cl"]=1
-            fi
-            # Fetched once per cluster — build_summary needs it to ask for the
-            # previous epoch's reward.
-            cluster_epoch["$cl"]=$(current_epoch "$cl")
-        done
-        for pk in "${active_nodes[@]}"; do
-            cl="${NODE_CLUSTER[$pk]}"
-            [[ "${ready[$cl]:-0}" == "1" ]] || continue
-            send_info "$(build_summary "$pk" "${NODE_NAME[$pk]}" "$cl" \
-                "${NODE_VOTE[$pk]:-}" "${cluster_epoch[$cl]:-0}")"
-            # Rides the hourly cache refresh — the data is already here.
-            check_version "$pk" "${NODE_NAME[$pk]}" "$cl"
-        done
-        for cl in "${!used_clusters[@]}"; do
-            send_epoch_info "$cl"
-        done
+        send_hourly_report
         last_summary=$t
         mark_set summary "$t"
     fi

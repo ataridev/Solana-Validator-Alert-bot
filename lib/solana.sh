@@ -224,7 +224,7 @@ inflation_reward() {
 }
 
 # Sum a lamports stake field across all stake accounts, in SOL (2 decimals).
-# sum_stake_field <stakes_json> <field>   e.g. sum_stake_field "$json" activeStake
+# sum_stake_field <stakes_json> <field>   e.g. sum_stake_field "$json" activatingStake
 sum_stake_field() {
     local stakes_json="$1" field="$2" sum
     sum=$(echo "$stakes_json" | jq -c ".[] | .$field // 0" 2>/dev/null | paste -sd+ - | bc 2>/dev/null)

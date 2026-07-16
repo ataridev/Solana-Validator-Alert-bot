@@ -28,6 +28,19 @@ if ! command -v flock >/dev/null 2>&1; then
     echo "note: stubbing flock(1) — not available here"
 fi
 
+# Fake ping: prints whatever the fixture says. Real ICMP would make these tests
+# depend on the sandbox's network policy (CI runners often disallow raw
+# sockets), and the logic under test is the bot's, not ping's.
+cat > "$WORK/bin/ping" <<SH
+#!/bin/bash
+if [ -f "$WORK/ping_reply" ]; then
+    cat "$WORK/ping_reply"
+    exit 0
+fi
+exit 1
+SH
+chmod +x "$WORK/bin/ping"
+
 # Fake solana CLI: logs which subcommand was asked for, so a test can assert
 # that the fast loop never touches it.
 cat > "$WORK/bin/fake-solana" <<SH
@@ -76,6 +89,8 @@ PING_INTERVAL=60
 PING_COUNT=1
 PING_TIMEOUT=1
 PING_DEADLINE=3
+PING_ALERT_THRESHOLD=1
+PING_REPEAT_INTERVAL=1800
 BALANCE_INTERVAL=600
 BALANCE_REPEAT_INTERVAL=3600
 SKIP_ALERT_ENABLED=1
@@ -88,7 +103,7 @@ VERSION_ALERT_THRESHOLD=2
 VERSION_REPEAT_INTERVAL=86400
 SUMMARY_INTERVAL=3600
 SKIP_DOP=15
-DAILY_INFO_HOUR=99
+DAILY_INFO_HOUR=-1
 HEARTBEAT_HOUR=-1
 SFDP_ENABLED=1
 CONNECT_TIMEOUT=2
@@ -348,7 +363,117 @@ expect_no "newer version stays quiet" "cluster majority is on" "$out"
 date +%s > "$WORK/state/mark_summary"
 
 echo ""
-echo "24. the loop sleeps the remainder, so the period holds"
+echo "25. connectivity lost -> alarm (ping path, previously untested)"
+sed -i.bak 's|NODE_IP\["AAA"\]=""|NODE_IP["AAA"]="192.0.2.1"|' "$WORK/config.sh"
+printf '4 packets transmitted, 0 received, 100%% packet loss, time 3054ms\n' > "$WORK/ping_reply"
+echo "$OK" > "$WORK/rpc_reply"
+out=$(run_full)
+expect "alarms on lost ping" "TestNode — connectivity lost (ping 192.0.2.1 failing)!" "$out"
+
+echo ""
+echo "26. connectivity restored -> all clear"
+printf '4 packets transmitted, 4 received, 0%% packet loss, time 3054ms\n' > "$WORK/ping_reply"
+out=$(run_full)
+expect "restored" "TestNode — connectivity restored (192.0.2.1)" "$out"
+
+echo ""
+echo "27. ping cannot run at all -> silence, not a false recovery"
+printf '4 packets transmitted, 0 received, 100%% packet loss\n' > "$WORK/ping_reply"
+out=$(run_full)   # take the node down again
+expect "down again" "connectivity lost" "$out"
+rm -f "$WORK/ping_reply"          # fake ping now exits 1 with no output
+out=$(run_full)
+expect_ran "$out"
+expect_no "no false 'restored'" "connectivity restored" "$out"
+expect    "says so in the log"  "ping to 192.0.2.1 produced no result" "$out"
+sed -i.bak 's|NODE_IP\["AAA"\]="192.0.2.1"|NODE_IP["AAA"]=""|' "$WORK/config.sh"
+rm -f "$WORK/state/inet_AAA.state"
+
+echo ""
+echo "28. low balance -> alarm (balance path, previously untested)"
+cat > "$WORK/reply_getBalance" <<'JSON'
+{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":420000000}}
+JSON
+out=$(run_full)
+expect "alarms below threshold" "TestNode — low identity balance: 0.42 SOL (threshold 1)" "$out"
+
+echo ""
+echo "29. balance back above the threshold -> quiet, and state cleared"
+cat > "$WORK/reply_getBalance" <<'JSON'
+{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":5000000000}}
+JSON
+out=$(run_full)
+expect_ran "$out"
+expect_no "no repeat alarm" "low identity balance" "$out"
+if [[ -f "$WORK/state/lowbal_AAA.state" ]]; then
+    echo "  FAIL state not cleared after recovery"; fail=$((fail+1))
+else
+    echo "  ok   state cleared after recovery"; pass=$((pass+1))
+fi
+
+echo ""
+echo "30. balance unreadable -> silence, not a false all-clear"
+echo '{"jsonrpc":"2.0","id":1,"result":{"value":null}}' > "$WORK/reply_getBalance"
+out=$(run_full)
+expect_ran "$out"
+expect_no "stays quiet" "low identity balance" "$out"
+rm -f "$WORK/reply_getBalance"
+
+echo ""
+echo "32. leading-zero hours must not silently disable the daily report"
+# printf '%02d' reads 08 as octal and errors, so hour_is never matches and the
+# report never fires — on the most natural way to write 8am.
+sed -i.bak 's/^DAILY_INFO_HOUR=-1$/DAILY_INFO_HOUR=08/' "$WORK/config.sh"
+echo "$OK" > "$WORK/rpc_reply"
+out=$(run_full)
+expect_no "no octal error"    "invalid octal" "$out"
+expect_no "config accepted"   "CONFIG: DAILY_INFO_HOUR" "$out"
+expect_ran "$out"
+mv "$WORK/config.sh.bak" "$WORK/config.sh"
+
+echo ""
+echo "33. leading-zero interval must not kill the sleep (100% CPU spin)"
+sed -i.bak 's/^CHECK_INTERVAL=1$/CHECK_INTERVAL=09/' "$WORK/config.sh"
+out=$(run_full)
+expect_ran "$out"
+expect_no "no arithmetic error" "value too great for base" "$out"
+mv "$WORK/config.sh.bak" "$WORK/config.sh"
+
+echo ""
+echo "34. an out-of-range hour is rejected, not silently ignored"
+sed -i.bak 's/^DAILY_INFO_HOUR=-1$/DAILY_INFO_HOUR=99/' "$WORK/config.sh"
+out=$(run_full)
+expect "caught"        "DAILY_INFO_HOUR must be an hour 0-23" "$out"
+expect "refused start" "FATAL: config.sh has errors"          "$out"
+mv "$WORK/config.sh.bak" "$WORK/config.sh"
+
+echo ""
+echo "35. a missing tunable is caught at startup, not fatal mid-flight"
+# unset in an arithmetic context under set -u exits the shell outright: the bot
+# would start clean, then die at the first balance check and restart-loop.
+sed -i.bak '/^BALANCE_REPEAT_INTERVAL=3600$/d' "$WORK/config.sh"
+out=$(run_full)
+expect "caught at startup" "BALANCE_REPEAT_INTERVAL must be a positive integer" "$out"
+expect "refused start"     "FATAL: config.sh has errors"                        "$out"
+mv "$WORK/config.sh.bak" "$WORK/config.sh"
+
+echo ""
+echo "36. ping alarm survives Telegram being down at the same time"
+# The bot's host losing upstream takes out the node check and the delivery path
+# together. The alarm must not be lost: the repeat re-sends it.
+sed -i.bak 's|NODE_IP\["AAA"\]=""|NODE_IP["AAA"]="192.0.2.1"|; s/^PING_REPEAT_INTERVAL=1800$/PING_REPEAT_INTERVAL=1/' "$WORK/config.sh"
+printf '4 packets transmitted, 0 received, 100%% packet loss\n' > "$WORK/ping_reply"
+rm -f "$WORK/state/inet_AAA.state"
+out=$(run_full)
+expect "alarm raised" "connectivity lost" "$out"
+sleep 1.1
+out=$(run_full)   # still down, repeat interval elapsed
+expect "and repeats, so a dropped one comes back" "still unreachable" "$out"
+mv "$WORK/config.sh.bak" "$WORK/config.sh"
+rm -f "$WORK/ping_reply" "$WORK/state/inet_AAA.state"
+
+echo ""
+echo "31. the loop sleeps the remainder, so the period holds"
 sed -i.bak 's/^CHECK_INTERVAL=1$/CHECK_INTERVAL=3/' "$WORK/config.sh"
 echo "$OK" > "$WORK/rpc_reply"
 : > "$WORK/rpc_calls.log"
