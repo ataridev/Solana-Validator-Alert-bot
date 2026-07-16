@@ -65,6 +65,23 @@ PING_DEADLINE=3              # hard limit for the whole ping run, seconds (-w)
 BALANCE_INTERVAL=600         # how often to check the identity balance, seconds
 BALANCE_REPEAT_INTERVAL=3600 # repeat balance alarm, seconds
 
+# --- Skip rate alarm --------------------------------------------------------
+# The dashboard has always shown the skip rate, but only once an hour and only
+# if someone reads it. This alarms on it instead.
+SKIP_ALERT_ENABLED=1
+SKIP_CHECK_INTERVAL=600      # how often to check the skip rate, seconds
+SKIP_ALERT_THRESHOLD=30      # skip % that raises an alarm
+SKIP_ALERT_MIN_SLOTS=20      # ignore below this many leader slots — early in an
+                             # epoch a couple of slots make the % meaningless
+SKIP_REPEAT_INTERVAL=3600    # repeat the skip alarm, seconds
+
+# --- Version alarm ----------------------------------------------------------
+# Compares against the version running the most stake in the cluster, checked
+# once an hour together with the dashboard refresh.
+VERSION_ALERT_ENABLED=1
+VERSION_ALERT_THRESHOLD=2    # consecutive hourly checks before alarming
+VERSION_REPEAT_INTERVAL=86400 # repeat, seconds (a version lag is not urgent)
+
 # --- Dashboard summary (rich info to the info chat) ------------------------
 SUMMARY_INTERVAL=3600        # how often to send the full summary, seconds (3600 = hourly)
 SKIP_DOP=15                  # margin over the cluster average skip for 🟢/🔴

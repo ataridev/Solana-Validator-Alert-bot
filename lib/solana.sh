@@ -120,6 +120,50 @@ node_facts() {
     [[ -n "$NF_RANK" ]]
 }
 
+# The version running the most stake in a cluster: cluster_majority_version <cluster>
+# Weighted by stake, not by node count: a thousand idle nodes on an old build
+# do not make it the version to be on. Delinquent nodes are excluded.
+cluster_majority_version() {
+    jq -r '[.validators[]
+            | select(.delinquent | not)
+            | select(.version != null and .version != "unknown")
+            | {version: .version, stake: (.activatedStake // 0)}]
+           | group_by(.version)
+           | map({version: .[0].version, stake: (map(.stake) | add)})
+           | sort_by(-.stake)
+           | .[0].version // empty' \
+        "$(validators_cache_file "$1")" 2>/dev/null
+}
+
+# version_lt <a> <b> — true when version a is older than b.
+# Plain numeric compare per component; sort -V would be simpler but is a GNU
+# extension, and suffixes like "2.1.0-jito" must not confuse it.
+version_lt() {
+    local IFS=.
+    local -a a b
+    read -ra a <<< "$1"
+    read -ra b <<< "$2"
+    local i x y
+    for (( i = 0; i < 3; i++ )); do
+        x="${a[i]:-0}"; y="${b[i]:-0}"
+        x="${x%%[^0-9]*}"; y="${y%%[^0-9]*}"
+        (( 10#${x:-0} < 10#${y:-0} )) && return 0
+        (( 10#${x:-0} > 10#${y:-0} )) && return 1
+    done
+    return 1
+}
+
+# Leader slots and produced blocks this epoch: block_production <cluster> <identity>
+# Prints "<leader_slots> <produced>", or nothing when the node has not been
+# leader yet (or the call failed).
+block_production() {
+    local cluster="$1" pubkey="$2" resp
+    resp=$(rpc_call "$cluster" \
+        '{"jsonrpc":"2.0","id":1,"method":"getBlockProduction","params":[{"identity":"'"$pubkey"'"}]}')
+    jq -r --arg pk "$pubkey" \
+        '.result.value.byIdentity[$pk] // empty | "\(.[0]) \(.[1])"' <<< "$resp" 2>/dev/null
+}
+
 # Gossip IP of a node: node_ip <cluster> <identity_pubkey>
 # Only used when NODE_IP is not set in config.sh — `solana gossip` used to
 # download the entire gossip table for this one field.

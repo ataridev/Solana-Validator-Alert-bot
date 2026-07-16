@@ -101,6 +101,58 @@ check "no version -> stake intact"     "58000000000" "$NF_STAKE"
 check "no version -> rank intact"      "1"           "$NF_RANK"
 check "no version -> skip intact"      "4.2"         "$NF_AVG_SKIP"
 
+# --- version comparison -----------------------------------------------------
+echo ""
+echo "version_lt: numeric per component, tolerant of suffixes"
+vlt() { if version_lt "$1" "$2"; then echo yes; else echo no; fi; }
+check "2.2.16 < 2.3.0"      "yes" "$(vlt 2.2.16 2.3.0)"
+check "2.3.0 not < 2.2.16"  "no"  "$(vlt 2.3.0 2.2.16)"
+check "equal is not older"  "no"  "$(vlt 2.2.16 2.2.16)"
+check "patch level counts"  "yes" "$(vlt 2.2.9 2.2.16)"   # not a string compare
+check "major beats minor"   "yes" "$(vlt 1.18.23 2.0.0)"
+check "suffix ignored"      "yes" "$(vlt 2.1.0-jito 2.2.0)"
+check "suffix, same version" "no" "$(vlt 2.2.0-jito 2.2.0)"
+check "short version"       "yes" "$(vlt 2.2 2.3.0)"
+
+echo ""
+echo "cluster_majority_version: weighted by stake, not by node count"
+cat > "$STATE_DIR/validators_v.json" <<'JSON'
+{"validators":[
+  {"identityPubkey":"A","delinquent":false,"version":"2.3.0","activatedStake":100000},
+  {"identityPubkey":"B","delinquent":false,"version":"2.2.16","activatedStake":10},
+  {"identityPubkey":"C","delinquent":false,"version":"2.2.16","activatedStake":10},
+  {"identityPubkey":"D","delinquent":false,"version":"2.2.16","activatedStake":10}],
+ "averageStakeWeightedSkipRate":1}
+JSON
+check "three small nodes lose to one big one" "2.3.0" "$(cluster_majority_version v)"
+
+cat > "$STATE_DIR/validators_w.json" <<'JSON'
+{"validators":[
+  {"identityPubkey":"A","delinquent":true,"version":"9.9.9","activatedStake":999999},
+  {"identityPubkey":"B","delinquent":false,"version":"2.3.0","activatedStake":100}],
+ "averageStakeWeightedSkipRate":1}
+JSON
+check "delinquent nodes excluded" "2.3.0" "$(cluster_majority_version w)"
+
+# --- block_production -------------------------------------------------------
+echo ""
+echo "block_production: leader slots and produced blocks"
+check "slots and produced" "32 30" \
+  "$(FAKE_REPLY='{"result":{"value":{"byIdentity":{"AAA":[32,30]}}}}'; block_production t AAA)"
+check "not leader yet -> empty" "" \
+  "$(FAKE_REPLY='{"result":{"value":{"byIdentity":{}}}}'; block_production t AAA)"
+check "rpc error -> empty" "" \
+  "$(FAKE_REPLY='{"error":{"code":-32602,"message":"bad"}}'; block_production t AAA)"
+
+# --- alarm_step custom pacing ----------------------------------------------
+echo ""
+echo "alarm_step: per-kind threshold and repeat interval"
+alarm_step version N4 1 5000 2 86400; check "1st hourly check: silent" "none"  "$ALARM_DECISION"
+alarm_step version N4 1 8600 2 86400; check "2nd check: own threshold" "first" "$ALARM_DECISION"
+# an hour later: the default 300s repeat would re-alarm here, 86400 must not
+alarm_step version N4 1 12200 2 86400; check "no hourly re-alarm" "none" "$ALARM_DECISION"
+alarm_step version N4 1 95000 2 86400; check "repeats after a day" "repeat" "$ALARM_DECISION"
+
 # --- inflation_reward -------------------------------------------------------
 echo ""
 echo "inflation_reward: the commission actually paid out"

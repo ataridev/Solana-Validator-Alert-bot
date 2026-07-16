@@ -121,6 +121,7 @@ validate_config() {
     # ${!v:-} so a parameter deleted from config.sh reports itself instead of
     # dying with "unbound variable" under set -u.
     for v in CHECK_INTERVAL PING_INTERVAL BALANCE_INTERVAL SUMMARY_INTERVAL \
+             SKIP_CHECK_INTERVAL SKIP_ALERT_THRESHOLD SKIP_ALERT_MIN_SLOTS \
              ALERT_THRESHOLD ALERT_REPEAT_INTERVAL DELINQUENT_SLOT_DISTANCE; do
         if [[ ! "${!v:-}" =~ ^[0-9]+$ ]] || (( ${!v:-0} < 1 )); then
             log_message "CONFIG: $v must be a positive integer (got '${!v:-<unset>}')"
@@ -248,6 +249,74 @@ check_ping() {
             state_clear inet "$pubkey"
         fi
     fi
+}
+
+# Skip rate watchdog. The dashboard has always shown this number, but only
+# hourly and only to whoever reads it — a validator skipping half its blocks is
+# an alarm, not a data point.
+check_skip() {
+    [[ "${SKIP_ALERT_ENABLED:-1}" == "1" ]] || return 0
+    local pubkey="$1" name="$2" cluster="$3"
+
+    local bp; bp=$(block_production "$cluster" "$pubkey")
+    # Not leader yet this epoch, or the call failed: nothing to judge.
+    [[ -z "$bp" ]] && return 0
+
+    local slots produced
+    read -r slots produced <<< "$bp"
+    [[ "$slots" =~ ^[0-9]+$ && "$produced" =~ ^[0-9]+$ ]] || return 0
+    # Early in an epoch a handful of slots makes the percentage meaningless.
+    (( slots < ${SKIP_ALERT_MIN_SLOTS:-20} )) && return 0
+
+    local skipped=$(( slots - produced ))
+    local skip; skip=$(bc <<< "scale=1; $skipped*100/$slots")
+    local t; t=$(now)
+    local over=0
+    (( $(bc <<< "$skip >= ${SKIP_ALERT_THRESHOLD:-30}") )) && over=1
+
+    alarm_step skip "$pubkey" "$over" "$t" \
+        "${ALERT_THRESHOLD:-3}" "${SKIP_REPEAT_INTERVAL:-3600}"
+    case "$ALARM_DECISION" in
+        first)
+            send_alarm "📉 ${name} — skip rate ${skip}% (over ${SKIP_ALERT_THRESHOLD}%), ${skipped} of ${slots} leader slots missed"
+            ;;
+        repeat)
+            send_alarm "📉 ${name} — skip rate still ${skip}% (${skipped}/${slots} leader slots)"
+            ;;
+        recover)
+            send_alarm "✅ ${name} — skip rate back to ${skip}%"
+            ;;
+    esac
+    return 0
+}
+
+# Version watchdog: falling behind the cluster is how a validator quietly stops
+# being able to vote after a feature gate activates.
+check_version() {
+    [[ "${VERSION_ALERT_ENABLED:-1}" == "1" ]] || return 0
+    local pubkey="$1" name="$2" cluster="$3"
+
+    node_facts "$cluster" "$pubkey" || return 0
+    local mine="$NF_VERSION"
+    [[ -z "$mine" || "$mine" == "unknown" ]] && return 0
+
+    local majority; majority=$(cluster_majority_version "$cluster")
+    [[ -z "$majority" ]] && return 0
+
+    local t; t=$(now) behind=0
+    version_lt "$mine" "$majority" && behind=1
+
+    alarm_step version "$pubkey" "$behind" "$t" \
+        "${VERSION_ALERT_THRESHOLD:-2}" "${VERSION_REPEAT_INTERVAL:-86400}"
+    case "$ALARM_DECISION" in
+        first|repeat)
+            send_alarm "⬆️ ${name} — running ${mine}, cluster majority is on ${majority}"
+            ;;
+        recover)
+            send_alarm "✅ ${name} — version ${mine} is no longer behind the cluster"
+            ;;
+    esac
+    return 0
 }
 
 check_balance() {
@@ -458,6 +527,7 @@ log_message "Bot started. Active nodes: ${#active_nodes[@]}. Clusters: ${!used_c
 # a restart during DAILY_INFO_HOUR/HEARTBEAT_HOUR re-sends that day's message.
 last_ping=0
 last_balance=0
+last_skip=0
 last_summary=$(mark_get summary); : "${last_summary:=0}"
 last_daily=$(mark_get daily)          # date of the last daily summary (YYYY-MM-DD)
 last_heartbeat=$(mark_get heartbeat)
@@ -488,7 +558,15 @@ while true; do
         last_balance=$t
     fi
 
-    # --- 4. Dashboard summary + epoch --------------------------------------
+    # --- 4. Skip rate -------------------------------------------------------
+    if (( t - last_skip >= SKIP_CHECK_INTERVAL )); then
+        for pk in "${active_nodes[@]}"; do
+            check_skip "$pk" "${NODE_NAME[$pk]}" "${NODE_CLUSTER[$pk]}"
+        done
+        last_skip=$t
+    fi
+
+    # --- 5. Dashboard summary + epoch --------------------------------------
     if (( t - last_summary >= SUMMARY_INTERVAL )); then
         # The full validator list is only needed for the dashboard, so it is
         # fetched here — hourly — instead of on every fast cycle. A cluster
@@ -507,6 +585,8 @@ while true; do
             [[ "${ready[$cl]:-0}" == "1" ]] || continue
             send_info "$(build_summary "$pk" "${NODE_NAME[$pk]}" "$cl" \
                 "${NODE_VOTE[$pk]:-}" "${cluster_epoch[$cl]:-0}")"
+            # Rides the hourly cache refresh — the data is already here.
+            check_version "$pk" "${NODE_NAME[$pk]}" "$cl"
         done
         for cl in "${!used_clusters[@]}"; do
             send_epoch_info "$cl"
@@ -515,7 +595,7 @@ while true; do
         mark_set summary "$t"
     fi
 
-    # --- 5. Daily info (SFDP/KYC + stake flows) at DAILY_INFO_HOUR -----------
+    # --- 6. Daily info (SFDP/KYC + stake flows) at DAILY_INFO_HOUR -----------
     today=$(date +%Y-%m-%d)
     hour=$(date +%H)
     if hour_is "$hour" "$DAILY_INFO_HOUR" && [[ "$last_daily" != "$today" ]]; then
@@ -527,7 +607,7 @@ while true; do
         mark_set daily "$today"
     fi
 
-    # --- 6. Heartbeat "bot alive" ------------------------------------------
+    # --- 7. Heartbeat "bot alive" ------------------------------------------
     if (( HEARTBEAT_HOUR >= 0 )) && hour_is "$hour" "$HEARTBEAT_HOUR" && [[ "$last_heartbeat" != "$today" ]]; then
         send_info "🤖 Bot is running. Monitoring ${#active_nodes[@]} nodes."
         last_heartbeat=$today

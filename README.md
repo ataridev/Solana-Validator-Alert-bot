@@ -35,6 +35,9 @@ on the cheapest VPS.
 - 💾 **Persistent state** — survives a daemon restart; the bot remembers which
   nodes were delinquent.
 - 💰 **Balance & connectivity alarms** — low identity balance and lost ping.
+- 📉 **Skip rate & version alarms** — a validator skipping blocks or lagging
+  behind the cluster's majority version is an alarm, not a number to notice in
+  a dashboard once an hour.
 
 ## Demo
 
@@ -47,6 +50,8 @@ on the cheapest VPS.
 👻 MyNode MainNet — gone from the validator list! (confirmed over 3 checks)
 💰 MyNode MainNet — low identity balance: 0.42 SOL (threshold 1)
 📡 MyNode MainNet — connectivity lost (ping 1.2.3.4 failing)!
+📉 MyNode MainNet — skip rate 40.0% (over 30%), 40 of 100 leader slots missed
+⬆️ MyNode MainNet — running 2.2.16, cluster majority is on 2.3.0
 ```
 
 **Info chat** (scheduled status report):
@@ -94,6 +99,12 @@ A single daemon with several polling cadences:
   so an unreachable host cannot stall the loop.
 - **Balance** (`BALANCE_INTERVAL`, 10 min) — identity balance. Deliberately
   slower than the ping: a balance drains over hours.
+- **Skip rate** (`SKIP_CHECK_INTERVAL`, 10 min) — alarms past
+  `SKIP_ALERT_THRESHOLD`, ignoring epochs with fewer than
+  `SKIP_ALERT_MIN_SLOTS` leader slots, where the percentage means nothing.
+- **Version** (hourly, with the cache refresh) — alarms when the node falls
+  behind the version running the most stake in the cluster. Running *ahead* is
+  not an alarm.
 - **Summary** (`SUMMARY_INTERVAL`, 1 h) — full status report per node + epoch
   info. This is the only thing that downloads the whole validator list; one
   `jq` pass over it yields version, credits, stake, rank and cluster average.

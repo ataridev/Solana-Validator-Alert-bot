@@ -42,16 +42,22 @@ state_active() {
 #  Sticky-alarm state machine, shared by every problem kind.
 # ============================================================================
 
-# alarm_step <kind> <pubkey> <problem:0|1> <now_ts>
+# alarm_step <kind> <pubkey> <problem:0|1> <now_ts> [threshold] [repeat_interval]
 # Sets ALARM_DECISION to one of:
 #   none    — nothing to report
-#   first   — problem confirmed ALERT_THRESHOLD times in a row, alarm now
-#   repeat  — still broken and ALERT_REPEAT_INTERVAL has passed since the last
+#   first   — problem confirmed <threshold> times in a row, alarm now
+#   repeat  — still broken and <repeat_interval> has passed since the last one
 #   recover — problem gone, and we had actually alarmed about it
 # Leaves ST_START/ST_COUNT/ST_LAST loaded so the caller can build the message
 # (duration, number of confirmations).
+#
+# threshold/repeat_interval default to ALERT_THRESHOLD/ALERT_REPEAT_INTERVAL,
+# which suit a 10s watchdog. Slower checks pass their own: an hourly version
+# check with a 5-minute repeat would re-alarm on every single check.
 alarm_step() {
     local kind="$1" pubkey="$2" problem="$3" t="$4"
+    local threshold="${5:-$ALERT_THRESHOLD}"
+    local repeat="${6:-$ALERT_REPEAT_INTERVAL}"
     ALARM_DECISION="none"
 
     if (( problem )); then
@@ -65,11 +71,11 @@ alarm_step() {
         if (( ST_LAST == 0 )); then
             # Not alarmed yet — fire once the problem is confirmed, so a single
             # bad poll cannot raise an alarm on its own.
-            if (( ST_COUNT >= ALERT_THRESHOLD )); then
+            if (( ST_COUNT >= threshold )); then
                 ST_LAST="$t"
                 ALARM_DECISION="first"
             fi
-        elif (( t - ST_LAST >= ALERT_REPEAT_INTERVAL )); then
+        elif (( t - ST_LAST >= repeat )); then
             ST_LAST="$t"
             ALARM_DECISION="repeat"
         fi

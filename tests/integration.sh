@@ -78,6 +78,14 @@ PING_TIMEOUT=1
 PING_DEADLINE=3
 BALANCE_INTERVAL=600
 BALANCE_REPEAT_INTERVAL=3600
+SKIP_ALERT_ENABLED=1
+SKIP_CHECK_INTERVAL=1
+SKIP_ALERT_THRESHOLD=30
+SKIP_ALERT_MIN_SLOTS=20
+SKIP_REPEAT_INTERVAL=3600
+VERSION_ALERT_ENABLED=1
+VERSION_ALERT_THRESHOLD=2
+VERSION_REPEAT_INTERVAL=86400
 SUMMARY_INTERVAL=3600
 SKIP_DOP=15
 DAILY_INFO_HOUR=99
@@ -112,6 +120,18 @@ run() {
 }
 run_full() {   # whole output, for multi-line messages
     TG_DRYRUN=1 ONE_SHOT=1 bash "$WORK/bot.sh" 2>&1
+}
+
+# A silent bot and a dead bot look identical to expect_no, so any test that
+# asserts an absence must first prove the run actually happened.
+expect_ran() {
+    if grep -q 'Bot started' <<< "$1" && grep -q 'ONE_SHOT: one iteration done' <<< "$1"; then
+        echo "  ok   the cycle actually ran"
+        pass=$((pass+1))
+    else
+        echo "  FAIL the bot never completed a cycle — an absence proves nothing here"
+        fail=$((fail+1))
+    fi
 }
 
 pass=0; fail=0
@@ -193,6 +213,7 @@ out=$(run_full)
 expect    "dashboard sent"        "TestNode"              "$out"
 expect    "active stake"          "active_stk >>>[58.00]" "$out"
 expect    "rank by credits"       "rank>[2]"              "$out"
+expect_ran "$out"
 expect_no "activating not hourly" "activating"            "$out"
 expect    "validators pulled"     "validators"            "$(cat "$WORK/cli_calls.log")"
 expect_no "gossip not called"     "gossip"                "$(cat "$WORK/cli_calls.log")"
@@ -244,12 +265,90 @@ echo "16. SFDP_ENABLED=0 skips api.solana.org"
 rm -f "$WORK/state/mark_summary"
 echo 'SFDP_ENABLED=0' >> "$WORK/config.sh"
 out=$(run_full)
+expect_ran "$out"
 expect_no "no onboard line" "onboard" "$out"
 sed -i.bak '/^SFDP_ENABLED=0$/d' "$WORK/config.sh"
 date +%s > "$WORK/state/mark_summary"
 
 echo ""
-echo "17. the loop sleeps the remainder, so the period holds"
+echo "17. skip rate alarm"
+rm -f "$WORK/state/mark_summary" "$WORK/state/skip_AAA.state"
+date +%s > "$WORK/state/mark_summary"
+# 40 of 100 leader slots missed = 40%, over the 30% threshold
+cat > "$WORK/reply_getBlockProduction" <<'JSON'
+{"jsonrpc":"2.0","id":1,"result":{"value":{"byIdentity":{"AAA":[100,60]}}}}
+JSON
+echo "$OK" > "$WORK/rpc_reply"
+out=$(run_full)
+expect "alarms over threshold" "TestNode — skip rate 40.0% (over 30%), 40 of 100 leader slots missed" "$out"
+
+echo ""
+echo "18. skip recovers -> all clear"
+cat > "$WORK/reply_getBlockProduction" <<'JSON'
+{"jsonrpc":"2.0","id":1,"result":{"value":{"byIdentity":{"AAA":[100,98]}}}}
+JSON
+out=$(run_full)
+expect "recovery" "TestNode — skip rate back to 2.0%" "$out"
+
+echo ""
+echo "19. too few leader slots -> no alarm (early-epoch noise)"
+rm -f "$WORK/state/skip_AAA.state"
+# 5 of 5 missed is 100%, but 5 slots says nothing
+cat > "$WORK/reply_getBlockProduction" <<'JSON'
+{"jsonrpc":"2.0","id":1,"result":{"value":{"byIdentity":{"AAA":[5,0]}}}}
+JSON
+out=$(run_full)
+expect_ran "$out"
+expect_no "stays quiet on 5 slots" "skip rate" "$out"
+
+echo ""
+echo "20. not leader yet this epoch -> no alarm"
+cat > "$WORK/reply_getBlockProduction" <<'JSON'
+{"jsonrpc":"2.0","id":1,"result":{"value":{"byIdentity":{}}}}
+JSON
+out=$(run_full)
+expect_ran "$out"
+expect_no "stays quiet" "skip rate" "$out"
+rm -f "$WORK/reply_getBlockProduction"
+
+echo ""
+echo "21. version behind the cluster majority"
+rm -f "$WORK/state/mark_summary" "$WORK/state/version_AAA.state"
+# AAA runs 2.2.16; the stake majority is on 2.3.0
+cat > "$WORK/fake_validators.json" <<'JSON'
+{"validators":[{"identityPubkey":"AAA","delinquent":false,"version":"2.2.16","epochCredits":250,"activatedStake":100},{"identityPubkey":"TOP","delinquent":false,"version":"2.3.0","epochCredits":500,"activatedStake":900000}],"averageStakeWeightedSkipRate":4.20}
+JSON
+echo "$OK" > "$WORK/rpc_reply"
+out=$(run_full)   # VERSION_ALERT_THRESHOLD=2: first check is silent
+expect_no "first check silent" "cluster majority" "$out"
+rm -f "$WORK/state/mark_summary"
+out=$(run_full)
+expect "alarms on the second" "TestNode — running 2.2.16, cluster majority is on 2.3.0" "$out"
+
+echo ""
+echo "22. upgraded to the majority version -> all clear"
+rm -f "$WORK/state/mark_summary"
+cat > "$WORK/fake_validators.json" <<'JSON'
+{"validators":[{"identityPubkey":"AAA","delinquent":false,"version":"2.3.0","epochCredits":250,"activatedStake":100},{"identityPubkey":"TOP","delinquent":false,"version":"2.3.0","epochCredits":500,"activatedStake":900000}],"averageStakeWeightedSkipRate":4.20}
+JSON
+out=$(run_full)
+expect "recovery" "TestNode — version 2.3.0 is no longer behind the cluster" "$out"
+
+echo ""
+echo "23. running ahead of the cluster is not an alarm"
+rm -f "$WORK/state/mark_summary" "$WORK/state/version_AAA.state"
+cat > "$WORK/fake_validators.json" <<'JSON'
+{"validators":[{"identityPubkey":"AAA","delinquent":false,"version":"2.4.0","epochCredits":250,"activatedStake":100},{"identityPubkey":"TOP","delinquent":false,"version":"2.3.0","epochCredits":500,"activatedStake":900000}],"averageStakeWeightedSkipRate":4.20}
+JSON
+out=$(run_full)
+rm -f "$WORK/state/mark_summary"
+out=$(run_full)
+expect_ran "$out"
+expect_no "newer version stays quiet" "cluster majority is on" "$out"
+date +%s > "$WORK/state/mark_summary"
+
+echo ""
+echo "24. the loop sleeps the remainder, so the period holds"
 sed -i.bak 's/^CHECK_INTERVAL=1$/CHECK_INTERVAL=3/' "$WORK/config.sh"
 echo "$OK" > "$WORK/rpc_reply"
 : > "$WORK/rpc_calls.log"
