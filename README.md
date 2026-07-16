@@ -32,8 +32,10 @@ on the cheapest VPS.
 - 🚀 **Efficient** — the watchdog polls a single `getVoteAccounts` filtered to
   your vote account: a few hundred bytes per check. The full validator list is
   only pulled once an hour, for the dashboard.
-- 💾 **Persistent state** — survives a daemon restart; the bot remembers which
-  nodes were delinquent.
+- 💾 **Persistent state** — survives a daemon restart. Every alarm (delinquency,
+  gone, connectivity, balance, skip, version) keeps its own state, and the loop
+  timers are on disk too, so a restart does not replay the hourly report or
+  re-send a daily message that already went out.
 - 💰 **Balance & connectivity alarms** — low identity balance and lost ping.
 - 📉 **Skip rate & version alarms** — a validator skipping blocks or lagging
   behind the cluster's majority version is an alarm, not a number to notice in
@@ -50,9 +52,15 @@ on the cheapest VPS.
 👻 MyNode MainNet — gone from the validator list! (confirmed over 3 checks)
 💰 MyNode MainNet — low identity balance: 0.42 SOL (threshold 1)
 📡 MyNode MainNet — connectivity lost (ping 1.2.3.4 failing)!
+📡 MyNode MainNet — still unreachable (ping 1.2.3.4, for 30 min)
+📡 MyNode MainNet — connectivity restored (1.2.3.4)
 📉 MyNode MainNet — skip rate 40.0% (over 30%), 40 of 100 leader slots missed
 ⬆️ MyNode MainNet — running 2.2.16, cluster majority is on 2.3.0
 ```
+
+Every alarm is confirmed over several checks before it fires, repeats on its own
+interval while the problem lasts, and clears with a recovery message. Nothing is
+sent when the bot cannot tell — an RPC blip is never reported as a recovery.
 
 **Info chat** (scheduled status report):
 
@@ -121,9 +129,9 @@ Solana-Validator-Alert-bot/
 ├── config.sh            # nodes (arrays keyed by pubkey) + all parameters
 ├── secrets.env(.example)# BOT_TOKEN, CHAT_ID_* — out of git
 ├── lib/
-│   ├── telegram.sh      # delivery + throttling
-│   ├── solana.sh        # CLI/RPC wrappers + per-cluster cache
-│   └── state.sh         # persistent delinquency/alarm state
+│   ├── telegram.sh      # delivery: retries, throttling, HTML escaping
+│   ├── solana.sh        # RPC wrappers + per-cluster cache (CLI: hourly/daily only)
+│   └── state.sh         # alarm state machine, on-disk state and timers
 ├── bot.sh               # daemon
 ├── tests/
 │   ├── run.sh           # whole suite
@@ -144,7 +152,9 @@ cd Solana-Validator-Alert-bot
 
 Then edit your config (see below) and start the bot.
 
-> Requires the `solana` CLI (path is set in `config.sh` → `SOLANA_PATH`).
+> Requires the `solana` CLI (path is set in `config.sh` → `SOLANA_PATH`), but
+> only for the hourly validator list and the daily stake flows — the watchdog
+> itself is plain JSON-RPC.
 
 ## Configuration
 
@@ -183,8 +193,9 @@ sudo systemctl status solana-validator-alert-bot
 journalctl -u solana-validator-alert-bot -f      # live logs
 ```
 
-The service restarts automatically (`Restart=always`). Delinquency state is
-stored in `state/` and survives a restart.
+The service restarts automatically (`Restart=always`). Alarm state and loop
+timers live in `state/` and survive a restart. Under systemd the log goes to the
+journal only — `bot.log` is not written, so there is nothing to rotate.
 
 ## Run manually
 
@@ -222,11 +233,18 @@ misconfigured looks alive while watching nothing.
 
 No network, no Telegram token, no real validator: the integration suite runs
 `bot.sh` against a local fake RPC and a fake `solana` CLI in `TG_DRYRUN` mode,
-and asserts on the messages it *would* have sent. Needs `python3` on top of the
-bot's own dependencies. Both suites run in CI on every push.
+and asserts on the messages it *would* have sent. `ping` is stubbed too — CI
+sandboxes often disallow raw sockets, and the logic under test is the bot's, not
+ping's. Needs `python3` on top of the bot's own dependencies.
+
+CI runs both suites on pull requests and on pushes to `main` — not on every
+branch push.
 
 The failure they mostly guard against is the quiet one — a monitor reporting
-"recovered" (or nothing at all) when it simply could not tell.
+"recovered", or nothing at all, when it simply could not tell. Most of the bugs
+these tests exist for were of exactly that shape: a `jq` filter that swallowed
+`false`, an empty `ping` result read as "reachable", an octal `08` that disabled
+the daily report.
 
 ## Dependencies
 
