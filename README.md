@@ -6,6 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![ShellCheck](https://github.com/ataridev/Solana-Validator-Alert-bot/actions/workflows/shellcheck.yml/badge.svg)](../../actions)
+[![Tests](https://github.com/ataridev/Solana-Validator-Alert-bot/actions/workflows/tests.yml/badge.svg)](../../actions)
 ![Bash](https://img.shields.io/badge/Bash-4%2B-1f425f.svg)
 ![Solana](https://img.shields.io/badge/Solana-validator%20ops-14F195.svg)
 
@@ -22,15 +23,23 @@ on the cheapest VPS.
 
 - ⚡ **Fast delinquency detection** — continuous daemon, catches delinquency
   within seconds, with confirmation (anti false-positive), anti-spam, and
-  recovery notifications.
-- 📊 **Rich status report** — balance, stake (active/activating/deactivating),
-  skip rate vs cluster average, credits, rank, commission, epoch, SFDP/KYC.
+  recovery notifications. A validator that disappears from the list entirely
+  raises its own alarm instead of being mistaken for a recovery.
+- 📊 **Rich status report** — balance, active stake, skip rate vs cluster
+  average, credits, rank, epoch, and the commission actually paid out last
+  epoch. Stake flows and SFDP/KYC come once a day.
 - 🌐 **Mixed clusters** — testnet and mainnet nodes in a single instance.
-- 🚀 **Efficient** — one `solana validators` request per cluster per cycle
-  (cached and reused for every node), not one request per node.
-- 💾 **Persistent state** — survives a daemon restart; the bot remembers which
-  nodes were delinquent.
+- 🚀 **Efficient** — the watchdog polls a single `getVoteAccounts` filtered to
+  your vote account: a few hundred bytes per check. The full validator list is
+  only pulled once an hour, for the dashboard.
+- 💾 **Persistent state** — survives a daemon restart. Every alarm (delinquency,
+  gone, connectivity, balance, skip, version) keeps its own state, and the loop
+  timers are on disk too, so a restart does not replay the hourly report or
+  re-send a daily message that already went out.
 - 💰 **Balance & connectivity alarms** — low identity balance and lost ping.
+- 📉 **Skip rate & version alarms** — a validator skipping blocks or lagging
+  behind the cluster's majority version is an alarm, not a number to notice in
+  a dashboard once an hour.
 
 ## Demo
 
@@ -40,9 +49,18 @@ on the cheapest VPS.
 🚨 MyNode MainNet — delinquent! (confirmed over 3 checks)
 ❗ MyNode MainNet — still delinquent! (for 5 min)
 ✅ MyNode MainNet — back online! (was delinquent 12 min)
+👻 MyNode MainNet — gone from the validator list! (confirmed over 3 checks)
 💰 MyNode MainNet — low identity balance: 0.42 SOL (threshold 1)
 📡 MyNode MainNet — connectivity lost (ping 1.2.3.4 failing)!
+📡 MyNode MainNet — still unreachable (ping 1.2.3.4, for 30 min)
+📡 MyNode MainNet — connectivity restored (1.2.3.4)
+📉 MyNode MainNet — skip rate 40.0% (over 30%), 40 of 100 leader slots missed
+⬆️ MyNode MainNet — running 2.2.16, cluster majority is on 2.3.0
 ```
+
+Every alarm is confirmed over several checks before it fires, repeats on its own
+interval while the problem lasts, and clears with a recovery message. Nothing is
+sent when the bot cannot tell — an RPC blip is never reported as a recovery.
 
 **Info chat** (scheduled status report):
 
@@ -54,24 +72,56 @@ skip:🟢5.55% Average:4.20%
 credits >[412800] [98.50%]
 rank>[123]
 active_stk >>>[58000.00]
-activating >>>[1500.00🟢]
-deactivating >[0.00]
 balance>[12.34]
 vote_balance>>[3.50]
-commission>[earn 1.234 sol]
+commission>[1.23 sol | ep 811]
+```
+
+`commission` is the reward actually paid out to the vote account for the last
+completed epoch (`getInflationReward`), not an estimate — it reads `n/a` until
+the first epoch closes.
+
+**Daily** (SFDP/KYC + stake flows — the slow queries, once a day):
+
+```
+MyNode MainNet [Abcd123x]
+✅ SFDP: approved
+🔰 KYC: verified
+
+MyNode MainNet [Abcd123x]
+activating >>>[1500.00🟢]
+deactivating >[0.00]
 ```
 
 ## Architecture
 
 A single daemon with several polling cadences:
 
-- **Fast loop** (`CHECK_INTERVAL`, 10 s) — delinquency only. One `solana
-  validators` call per cluster is cached and reused for all nodes. Skips a
-  cluster whose data failed to refresh, so an RPC blip never triggers a false
-  recovery.
-- **Medium loop** (`PING_INTERVAL`, 60 s) — server ping and identity balance.
-- **Summary** (`SUMMARY_INTERVAL`, 1 h) — full status report per node + epoch info.
-- **Daily** (`DAILY_INFO_HOUR`) — SFDP and KYC status.
+- **Fast loop** (`CHECK_INTERVAL`, 10 s) — delinquency only, via one
+  `getVoteAccounts` per node filtered by `votePubkey` (`delinquentSlotDistance`
+  is applied by the RPC node itself). An unreadable answer is treated as
+  "unknown" and stays silent, so an RPC blip never triggers a false recovery.
+  The loop sleeps the *remainder* of the interval, so the period does not drift
+  with RPC latency.
+- **Ping** (`PING_INTERVAL`, 60 s) — server reachability, bounded by `-W`/`-w`
+  so an unreachable host cannot stall the loop. Alarms after
+  `PING_ALERT_THRESHOLD` failed rounds (ICMP is routinely rate-limited in
+  transit, so one bad round is not an outage) and repeats every
+  `PING_REPEAT_INTERVAL`.
+- **Balance** (`BALANCE_INTERVAL`, 10 min) — identity balance. Deliberately
+  slower than the ping: a balance drains over hours.
+- **Skip rate** (`SKIP_CHECK_INTERVAL`, 10 min) — alarms past
+  `SKIP_ALERT_THRESHOLD`, ignoring epochs with fewer than
+  `SKIP_ALERT_MIN_SLOTS` leader slots, where the percentage means nothing.
+- **Version** (hourly, with the cache refresh) — alarms when the node falls
+  behind the version running the most stake in the cluster. Running *ahead* is
+  not an alarm.
+- **Summary** (`SUMMARY_INTERVAL`, 1 h) — full status report per node + epoch
+  info. This is the only thing that downloads the whole validator list; one
+  `jq` pass over it yields version, credits, stake, rank and cluster average.
+- **Daily** (`DAILY_INFO_HOUR`, `-1` to disable) — SFDP/KYC status and stake
+  flows (activating/deactivating). These need `solana stakes`, which scans the
+  whole stake program, and the numbers only move once per epoch.
 - **Heartbeat** (`HEARTBEAT_HOUR`) — "bot alive" message.
 
 ```
@@ -79,10 +129,15 @@ Solana-Validator-Alert-bot/
 ├── config.sh            # nodes (arrays keyed by pubkey) + all parameters
 ├── secrets.env(.example)# BOT_TOKEN, CHAT_ID_* — out of git
 ├── lib/
-│   ├── telegram.sh      # delivery + throttling
-│   ├── solana.sh        # CLI/RPC wrappers + per-cluster cache
-│   └── state.sh         # persistent delinquency/alarm state
+│   ├── telegram.sh      # delivery: retries, throttling, HTML escaping
+│   ├── solana.sh        # RPC wrappers + per-cluster cache (CLI: hourly/daily only)
+│   └── state.sh         # alarm state machine, on-disk state and timers
 ├── bot.sh               # daemon
+├── tests/
+│   ├── run.sh           # whole suite
+│   ├── unit.sh          # library functions
+│   ├── integration.sh   # full cycles against a fake RPC
+│   └── fake_rpc.py      # local stand-in for a Solana RPC node
 ├── install.sh           # one-command setup + systemd unit generator
 └── solana-validator-alert-bot.service   # systemd unit template
 ```
@@ -97,7 +152,9 @@ cd Solana-Validator-Alert-bot
 
 Then edit your config (see below) and start the bot.
 
-> Requires the `solana` CLI (path is set in `config.sh` → `SOLANA_PATH`).
+> Requires the `solana` CLI (path is set in `config.sh` → `SOLANA_PATH`), but
+> only for the hourly validator list and the daily stake flows — the watchdog
+> itself is plain JSON-RPC.
 
 ## Configuration
 
@@ -108,7 +165,8 @@ Then edit your config (see below) and start the bot.
    nano secrets.env   # BOT_TOKEN, CHAT_ID_ALARM, CHAT_ID_INFO
    ```
 2. **Nodes.** In `config.sh` — one entry per node, the array key is the Identity
-   pubkey. testnet (`t`) and mainnet (`m`) can be mixed:
+   pubkey. `NODE_VOTE` is required (delinquency is checked by vote account).
+   testnet (`t`) and mainnet (`m`) can be mixed:
    ```bash
    NODE_NAME["IDENTITY1"]="MyNode TestNet"
    NODE_CLUSTER["IDENTITY1"]="t"
@@ -117,7 +175,10 @@ Then edit your config (see below) and start the bot.
    NODE_BALANCE_WARN["IDENTITY1"]=1
    NODE_ENABLED["IDENTITY1"]=1
    ```
-3. **Parameters** (intervals, thresholds, summary hours) — also in `config.sh`.
+3. **Parameters** (intervals, thresholds, summary hours, network timeouts) —
+   also in `config.sh`. Set `SFDP_ENABLED=0` if the validator is not in the
+   Solana Foundation Delegation Program: that skips the `api.solana.org`
+   lookups entirely.
 
 ## Run as a systemd service
 
@@ -132,8 +193,9 @@ sudo systemctl status solana-validator-alert-bot
 journalctl -u solana-validator-alert-bot -f      # live logs
 ```
 
-The service restarts automatically (`Restart=always`). Delinquency state is
-stored in `state/` and survives a restart.
+The service restarts automatically (`Restart=always`). Alarm state and loop
+timers live in `state/` and survive a restart. Under systemd the log goes to the
+journal only — `bot.log` is not written, so there is nothing to rotate.
 
 ## Run manually
 
@@ -142,9 +204,52 @@ stored in `state/` and survives a restart.
 tail -f bot.log
 ```
 
+`bot.log` is only written on manual runs and is capped at `LOG_MAX_KB` (rotated
+to `bot.log.1`). Under systemd the log goes to the journal instead — see below.
+
+Only one instance runs at a time (`flock`) — a manual run alongside the service
+will refuse to start rather than double every alarm.
+
+### Debugging
+
+```bash
+TG_DRYRUN=1 ONE_SHOT=1 ./bot.sh   # one cycle, messages logged instead of sent
+```
+
+- `TG_DRYRUN=1` — log messages instead of sending them to Telegram.
+- `ONE_SHOT=1` — run a single iteration and exit.
+
+On startup the bot validates its dependencies, the bot token (`getMe`) and
+`config.sh`, and refuses to start on an error — a monitor that runs
+misconfigured looks alive while watching nothing.
+
+## Tests
+
+```bash
+./tests/run.sh          # everything
+./tests/unit.sh         # library functions
+./tests/integration.sh  # full bot.sh cycles against a fake RPC
+```
+
+No network, no Telegram token, no real validator: the integration suite runs
+`bot.sh` against a local fake RPC and a fake `solana` CLI in `TG_DRYRUN` mode,
+and asserts on the messages it *would* have sent. `ping` is stubbed too — CI
+sandboxes often disallow raw sockets, and the logic under test is the bot's, not
+ping's. Needs `python3` on top of the bot's own dependencies.
+
+CI runs both suites on pull requests and on pushes to `main` — not on every
+branch push.
+
+The failure they mostly guard against is the quiet one — a monitor reporting
+"recovered", or nothing at all, when it simply could not tell. Most of the bugs
+these tests exist for were of exactly that shape: a `jq` filter that swallowed
+`false`, an empty `ping` result read as "reachable", an octal `08` that disabled
+the daily report.
+
 ## Dependencies
 
-`solana` CLI, `curl`, `jq`, `bc`, `ping`, `bash` (associative arrays → bash 4+).
+`solana` CLI, `curl`, `jq`, `bc`, `ping`, `timeout` (coreutils), `flock`
+(util-linux), `bash` (associative arrays → bash 4+). Tests also need `python3`.
 
 ## License
 

@@ -16,9 +16,12 @@ echo "    directory: $BOT_DIR"
 echo "    user:      $RUN_USER"
 
 # 1. Dependencies -----------------------------------------------------------
+# timeout (coreutils) caps hung RPC/CLI calls; flock (util-linux) keeps a second
+# instance from doubling every alarm. The bot refuses to start without them.
+declare -A PKG_OF=( [curl]=curl [jq]=jq [bc]=bc [timeout]=coreutils [flock]=util-linux )
 need=()
-for c in curl jq bc; do
-    command -v "$c" >/dev/null 2>&1 || need+=("$c")
+for c in curl jq bc timeout flock; do
+    command -v "$c" >/dev/null 2>&1 || need+=("${PKG_OF[$c]}")
 done
 if (( ${#need[@]} )); then
     echo "==> Installing missing dependencies: ${need[*]}"
