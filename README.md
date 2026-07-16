@@ -6,6 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![ShellCheck](https://github.com/ataridev/Solana-Validator-Alert-bot/actions/workflows/shellcheck.yml/badge.svg)](../../actions)
+[![Tests](https://github.com/ataridev/Solana-Validator-Alert-bot/actions/workflows/tests.yml/badge.svg)](../../actions)
 ![Bash](https://img.shields.io/badge/Bash-4%2B-1f425f.svg)
 ![Solana](https://img.shields.io/badge/Solana-validator%20ops-14F195.svg)
 
@@ -110,6 +111,11 @@ Solana-Validator-Alert-bot/
 │   ├── solana.sh        # CLI/RPC wrappers + per-cluster cache
 │   └── state.sh         # persistent delinquency/alarm state
 ├── bot.sh               # daemon
+├── tests/
+│   ├── run.sh           # whole suite
+│   ├── unit.sh          # library functions
+│   ├── integration.sh   # full cycles against a fake RPC
+│   └── fake_rpc.py      # local stand-in for a Solana RPC node
 ├── install.sh           # one-command setup + systemd unit generator
 └── solana-validator-alert-bot.service   # systemd unit template
 ```
@@ -192,10 +198,26 @@ On startup the bot validates its dependencies, the bot token (`getMe`) and
 `config.sh`, and refuses to start on an error — a monitor that runs
 misconfigured looks alive while watching nothing.
 
+## Tests
+
+```bash
+./tests/run.sh          # everything
+./tests/unit.sh         # library functions
+./tests/integration.sh  # full bot.sh cycles against a fake RPC
+```
+
+No network, no Telegram token, no real validator: the integration suite runs
+`bot.sh` against a local fake RPC and a fake `solana` CLI in `TG_DRYRUN` mode,
+and asserts on the messages it *would* have sent. Needs `python3` on top of the
+bot's own dependencies. Both suites run in CI on every push.
+
+The failure they mostly guard against is the quiet one — a monitor reporting
+"recovered" (or nothing at all) when it simply could not tell.
+
 ## Dependencies
 
 `solana` CLI, `curl`, `jq`, `bc`, `ping`, `timeout` (coreutils), `flock`
-(util-linux), `bash` (associative arrays → bash 4+).
+(util-linux), `bash` (associative arrays → bash 4+). Tests also need `python3`.
 
 ## License
 

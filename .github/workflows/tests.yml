@@ -1,0 +1,20 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # timeout(1) and flock(1) ship with the runner; the bot requires them and
+      # the suite deliberately does not stub them where they exist.
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq bc iputils-ping
+
+      - name: Run test suite
+        run: ./tests/run.sh
