@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Фейковый Solana RPC: на каждый POST отдаёт текущее содержимое reply-файла
-и логирует вызванный метод. Читает файл в момент запроса, а не заранее."""
+"""Fake Solana RPC: answers every POST with the current contents of the reply
+file and logs the method called. The file is read per request, not up front."""
 import http.server
 import json
 import os
